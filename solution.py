@@ -44,9 +44,54 @@ ODD_DIRS  = ((-1, -1), (-1, 0), (0, -1), (0, 1), (1, -1), (1, 0))
 # ================================================================
 _NTABLE_CACHE = {}
 
+def _compute_neighbors(r, c, size):
+    """Compute neighbors for a single cell on-the-fly."""
+    dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
+    nbs = []
+    for dr, dc in dirs:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < size and 0 <= nc < size:
+            nbs.append((nr, nc))
+    return tuple(nbs)
+
+
+class LazyNeighborTable:
+    """Lazy neighbor table that computes neighbors on demand for large boards."""
+    __slots__ = ('size', '_cache')
+
+    def __init__(self, size):
+        self.size = size
+        self._cache = {}
+
+    def __getitem__(self, r):
+        return _LazyRow(self, r)
+
+
+class _LazyRow:
+    __slots__ = ('_table', '_r')
+
+    def __init__(self, table, r):
+        self._table = table
+        self._r = r
+
+    def __getitem__(self, c):
+        key = (self._r, c)
+        cache = self._table._cache
+        val = cache.get(key)
+        if val is None:
+            val = _compute_neighbors(self._r, c, self._table.size)
+            cache[key] = val
+        return val
+
+
 def build_neighbor_table(size):
     if size in _NTABLE_CACHE:
         return _NTABLE_CACHE[size]
+    # For large boards, use lazy computation to avoid O(N^2) upfront cost
+    if size > 100:
+        table = LazyNeighborTable(size)
+        _NTABLE_CACHE[size] = table
+        return table
     table = [[None]*size for _ in range(size)]
     for r in range(size):
         dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
@@ -190,8 +235,11 @@ def build_dsu_from_board(board, size, ntable):
                 if r == size - 1:
                     dsu.union(idx, BOTTOM)
             # Conectar con vecinos del mismo color
-            for nr, nc in ntable[r][c]:
-                if board[nr][nc] == v:
+            # Only check right/down neighbors to avoid double-processing
+            dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
+            for dr, dc in dirs:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < size and 0 <= nc < size and board[nr][nc] == v:
                     dsu.union(idx, nr * size + nc)
     return dsu
 
@@ -446,10 +494,37 @@ def two_distance(board, size, player, ntable):
     return mind, on_path
 
 
+def _count_shortest_paths(board, size, player, ntable):
+    """
+    Count the number of cells on *any* shortest path for `player`.
+    A cell is on a shortest path if dist_fwd[r][c] + dist_rev[r][c] == min_dist.
+    More on-path cells ≈ more redundant paths ≈ harder to block.
+    Uses a cheap bidirectional Dijkstra already available.
+    """
+    opp = 3 - player
+    dfwd = dijkstra_full(board, size, player, ntable)
+    drev = dijkstra_reverse(board, size, player, ntable)
+    if player == 1:
+        mind = min(dfwd[r][size - 1] for r in range(size))
+    else:
+        mind = min(dfwd[size - 1][c] for c in range(size))
+    if mind >= INF:
+        return INF, 0
+    count = 0
+    for r in range(size):
+        for c in range(size):
+            if board[r][c] == opp:
+                continue
+            if dfwd[r][c] + drev[r][c] == mind:
+                count += 1
+    return mind, count
+
+
 def evaluate_fast(board, size, my_player, opponent, ntable):
     """
     Evaluación rápida basada en Dijkstra simple.
     Usada en nodos profundos del árbol donde velocidad > precisión.
+    For small boards (≤7) uses path counting to distinguish blocking moves.
     """
     my_dist = dijkstra_distance(board, size, my_player, ntable)
     opp_dist = dijkstra_distance(board, size, opponent, ntable)
@@ -461,7 +536,15 @@ def evaluate_fast(board, size, my_player, opponent, ntable):
     if my_dist >= INF:
         return -(WIN_SCORE // 2)
 
-    return (opp_dist - my_dist) * 200
+    score = (opp_dist - my_dist) * 200
+
+    # When distances are equal, use path-count to break ties (critical for blocking)
+    if size <= 11 and my_dist == opp_dist:
+        _, my_paths = _count_shortest_paths(board, size, my_player, ntable)
+        _, opp_paths = _count_shortest_paths(board, size, opponent, ntable)
+        score += (my_paths - opp_paths) * 10
+
+    return score
 
 
 def evaluate_board(board, size, my_player, opponent, ntable):
@@ -532,7 +615,6 @@ class SearchEngine:
     def _precompute_active_zone(self, board):
         """Identifica celdas vacías adyacentes a alguna pieza (zona caliente)."""
         size = self.size
-        ntable = self.ntable
         self.active = set()
         self.all_empty = []
         for r in range(size):
@@ -540,8 +622,10 @@ class SearchEngine:
                 if board[r][c] != 0:
                     continue
                 self.all_empty.append((r, c))
-                for nr, nc in ntable[r][c]:
-                    if board[nr][nc] != 0:
+                dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
+                for dr, dc in dirs:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < size and 0 <= nc < size and board[nr][nc] != 0:
                         self.active.add((r, c))
                         break
 
@@ -581,13 +665,26 @@ class SearchEngine:
             # History
             s += self.history[r][c][player] * 2
 
-            # Conectividad con piezas existentes
+            # Conectividad con piezas existentes — also detect near-win
+            own_neighbors = 0
             for nr, nc in ntable[r][c]:
                 v = board[nr][nc]
                 if v == player:
                     s += 12
+                    own_neighbors += 1
                 elif v == opp:
                     s += 7
+
+            # CRITICAL: Boost cells on borders that connect to own pieces
+            # This prevents winning moves on edges from being pruned
+            if player == 1:
+                if c == 0 or c == size - 1:
+                    if own_neighbors > 0:
+                        s += 5000  # border cell connecting to own chain
+            else:
+                if r == 0 or r == size - 1:
+                    if own_neighbors > 0:
+                        s += 5000  # border cell connecting to own chain
 
             # Centralidad
             dist_c = abs(r - center) + abs(c - center)
@@ -610,11 +707,41 @@ class SearchEngine:
                 self.killers[depth][1] = self.killers[depth][0]
                 self.killers[depth][0] = move
 
+    def _find_immediate_win(self, board):
+        """Scan ALL empty cells for an immediate winning move.
+        This runs before the search to guarantee winning moves are never pruned."""
+        size = self.size
+        ntable = self.ntable
+        player = self.my_player
+        N2 = size * size
+        for r in range(size):
+            for c in range(size):
+                if board[r][c] != 0:
+                    continue
+                # Make move
+                board[r][c] = player
+                snap_p = self.dsu_base.parent[:]
+                snap_r = self.dsu_base.rank[:]
+                dsu_add_stone(self.dsu_base, board, size, ntable, r, c, player)
+                won = dsu_check_win(self.dsu_base, size, player)
+                # Undo
+                board[r][c] = 0
+                self.dsu_base.parent = snap_p
+                self.dsu_base.rank = snap_r
+                if won:
+                    return (r, c)
+        return None
+
     # --- Búsqueda principal ---
     def search(self, board):
         empty = self.all_empty
         if not empty:
             return None
+
+        # CRITICAL: Check for immediate winning move before any pruning
+        win_move = self._find_immediate_win(board)
+        if win_move is not None:
+            return win_move
 
         # Generar candidatos: priorizar zona activa, pero incluir el resto
         if self.active:
@@ -747,8 +874,10 @@ class SearchEngine:
             for c in range(size):
                 if row[c] == 0:
                     has_neighbor = False
-                    for nr, nc in ntable[r][c]:
-                        if board[nr][nc] != 0:
+                    dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
+                    for dr, dc in dirs:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < size and 0 <= nc < size and board[nr][nc] != 0:
                             has_neighbor = True
                             break
                     if has_neighbor:
@@ -852,6 +981,73 @@ class SmartPlayer(Player):
         size = board.size
         bm = board.board
         my_player = self._identify_player(bm, size)
+
+        # --- Fast path for large boards ---
+        # For boards >100, avoid O(N^2) full-board scans.
+        # Use sparse approach: focus only on cells near existing pieces.
+        if size > 100:
+            center = size // 2
+            if bm[center][center] == 0:
+                return (center, center)
+            # Find all occupied cells (sparse scan for near-empty large boards)
+            occupied = []
+            for r in range(size):
+                for c in range(size):
+                    if bm[r][c] != 0:
+                        occupied.append((r, c))
+            # If very few pieces, play near center/existing pieces
+            if len(occupied) <= 4:
+                ntable = build_neighbor_table(size)
+                # Try center neighbors first
+                for nr, nc in ntable[center][center]:
+                    if bm[nr][nc] == 0:
+                        return (nr, nc)
+                # Try neighbors of occupied cells
+                for r, c in occupied:
+                    for nr, nc in ntable[r][c]:
+                        if bm[nr][nc] == 0:
+                            return (nr, nc)
+            # For more pieces on a large board, use a focused zone approach
+            ntable = build_neighbor_table(size)
+            # Build candidate zone: cells within radius 2 of any piece
+            zone = set()
+            for r, c in occupied:
+                for nr, nc in ntable[r][c]:
+                    if bm[nr][nc] == 0:
+                        zone.add((nr, nc))
+                    for nr2, nc2 in ntable[nr][nc]:
+                        if bm[nr2][nc2] == 0:
+                            zone.add((nr2, nc2))
+            if zone:
+                # Quick evaluation: pick the cell that minimizes our Dijkstra distance
+                best_move = None
+                best_score = -INF
+                opp = 3 - my_player
+                # Sample a subset if zone is large
+                candidates = list(zone)
+                if len(candidates) > 50:
+                    c_center = (size - 1) / 2.0
+                    candidates.sort(key=lambda rc: abs(rc[0]-c_center)+abs(rc[1]-c_center))
+                    candidates = candidates[:50]
+                for r, c in candidates:
+                    # Score: connectivity with own pieces + centrality
+                    s = 0
+                    for nr, nc in ntable[r][c]:
+                        if bm[nr][nc] == my_player:
+                            s += 20
+                        elif bm[nr][nc] == opp:
+                            s += 5
+                    c_center = (size - 1) / 2.0
+                    s += (size - abs(r - c_center) - abs(c - c_center)) * 2
+                    if my_player == 1:
+                        s += (size - abs(c - c_center)) * 1.5
+                    else:
+                        s += (size - abs(r - c_center)) * 1.5
+                    if s > best_score:
+                        best_score = s
+                        best_move = (r, c)
+                return best_move
+
         ntable = build_neighbor_table(size)
 
         # --- Apertura ---
