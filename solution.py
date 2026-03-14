@@ -71,7 +71,6 @@ HISTORY_MULTIPLIER: int = 2
 DISTANCE_WEIGHT: int = 200
 PATH_COUNT_WEIGHT: int = 10
 PATH_COUNT_MAX_SIZE: int = 11   # path counting only for boards ≤ this size
-BRIDGE_EVAL_WEIGHT: int = 3     # bridge-potential bonus in leaf evaluation
 
 # -- Search Parameters --
 TIME_BUDGET: float = 4.0
@@ -698,26 +697,6 @@ def evaluate_fast(
         _, opp_paths = two_distance(board, size, opponent, ntable)
         score += (my_paths - opp_paths) * PATH_COUNT_WEIGHT
 
-    # Bridge-potential scoring: intact virtual connections indicate
-    # stronger positional control beyond raw shortest-path distance
-    if size <= BRIDGE_MAX_SIZE and size in _BRIDGE_CACHE:
-        bridge_table = _BRIDGE_CACHE[size]
-        my_bridges = 0
-        opp_bridges = 0
-        for r in range(size):
-            for c in range(size):
-                cell = board[r][c]
-                if cell == 0:
-                    continue
-                for dest_r, dest_c, c1r, c1c, c2r, c2c in bridge_table[r][c]:
-                    if board[dest_r][dest_c] == cell:
-                        if board[c1r][c1c] == 0 and board[c2r][c2c] == 0:
-                            if cell == my_player:
-                                my_bridges += 1
-                            else:
-                                opp_bridges += 1
-        score += (my_bridges - opp_bridges) * BRIDGE_EVAL_WEIGHT
-
     return score
 
 
@@ -789,9 +768,8 @@ class SearchEngine:
         self.zt = get_zobrist_table(size)
         self.zhash: int = compute_zobrist(board, size, self.zt)
 
-        # Bounded transposition table (two-table generational)
+        # Bounded transposition table
         self.tt: Dict[int, Tuple[int, int, float, Optional[Tuple[int, int]]]] = {}
-        self.tt_old: Optional[Dict] = None
 
         # Killer moves: 2 slots per depth
         self.killers: List[List[Optional[Tuple[int, int]]]] = [
@@ -878,10 +856,8 @@ class SearchEngine:
         """Store entry with depth-preferred replacement policy.
 
         Existing deeper entries are never overwritten by shallower ones.
-        When the table exceeds ``TT_MAX_ENTRIES``, the current table is
-        demoted to a read-only fallback (``tt_old``) and a fresh table
-        is started — previous-generation entries remain accessible for
-        lookups but are gradually displaced.
+        When the table exceeds ``TT_MAX_ENTRIES``, all entries are cleared
+        (generation-based eviction) to guarantee bounded memory.
         """
         tt = self.tt
         existing = tt.get(key)
@@ -890,10 +866,8 @@ class SearchEngine:
             if depth < existing[0]:
                 return
         elif len(tt) >= TT_MAX_ENTRIES:
-            # Demote current table to read-only fallback
-            self.tt_old = tt
-            self.tt = {}
-            tt = self.tt
+            # Safety cap reached — start a fresh generation
+            tt.clear()
         tt[key] = (depth, flag, value, move)
 
     # -----------------------------------------------------------------
@@ -1125,7 +1099,6 @@ class SearchEngine:
         """Search from root with PVS.  Accepts custom alpha/beta for aspiration."""
         best_score = -INF
         best_move = moves[0]
-        empty_cells: Set[Tuple[int, int]] = set(self.all_empty)
 
         for i, move in enumerate(moves):
             self._check_time()
@@ -1133,7 +1106,6 @@ class SearchEngine:
 
             # ---- Make move ----
             board[r][c] = self.my_player
-            empty_cells.discard((r, c))
             self.zhash ^= self.zt[r][c][self.my_player]
             dsu_snap_parent = self.dsu_base.parent[:]
             dsu_snap_rank = self.dsu_base.rank[:]
@@ -1144,7 +1116,6 @@ class SearchEngine:
 
             if dsu_check_win(self.dsu_base, self.size, self.my_player):
                 board[r][c] = 0
-                empty_cells.add((r, c))
                 self.zhash ^= self.zt[r][c][self.my_player]
                 self.dsu_base.parent = dsu_snap_parent
                 self.dsu_base.rank = dsu_snap_rank
@@ -1154,22 +1125,18 @@ class SearchEngine:
             if i == 0:
                 score = -self._negamax(
                     board, depth - 1, -beta, -alpha, self.opponent,
-                    empty_cells,
                 )
             else:
                 score = -self._negamax(
                     board, depth - 1, -alpha - 1, -alpha, self.opponent,
-                    empty_cells,
                 )
                 if alpha < score < beta:
                     score = -self._negamax(
                         board, depth - 1, -beta, -score, self.opponent,
-                        empty_cells,
                     )
 
             # ---- Undo move ----
             board[r][c] = 0
-            empty_cells.add((r, c))
             self.zhash ^= self.zt[r][c][self.my_player]
             self.dsu_base.parent = dsu_snap_parent
             self.dsu_base.rank = dsu_snap_rank
@@ -1196,15 +1163,12 @@ class SearchEngine:
         alpha: float,
         beta: float,
         player: int,
-        empty_cells: Set[Tuple[int, int]],
     ) -> float:
         """Recursive negamax search with all pruning enhancements.
 
-        Uses an incremental ``empty_cells`` set (maintained via make/undo)
-        instead of O(N²) board scans for move generation.  Late Move
-        Reductions (LMR) reduce search depth for low-priority moves that
-        appear late in the move ordering, re-searching at full depth only
-        if the reduced search raises alpha.
+        Late Move Reductions (LMR) reduce search depth for low-priority
+        moves that appear late in the move ordering, re-searching at
+        full depth only if the reduced search raises alpha.
         """
         self.nodes += 1
         if self.nodes & TIME_CHECK_MASK == 0:
@@ -1218,8 +1182,6 @@ class SearchEngine:
         # ---- Transposition Table Lookup ----
         tt_key = self.zhash ^ (player * TT_PLAYER_MIX)
         tt_entry = self.tt.get(tt_key)
-        if tt_entry is None and self.tt_old is not None:
-            tt_entry = self.tt_old.get(tt_key)
         if tt_entry is not None:
             tt_depth, tt_flag, tt_value, tt_move = tt_entry
             if tt_depth >= depth:
@@ -1240,29 +1202,31 @@ class SearchEngine:
         if depth <= 0:
             return evaluate_fast(board, size, player, opp, ntable)
 
-        # ---- Move Generation: incremental empty-set iteration ----
+        # ---- Move Generation: active zone focus ----
+        empty: List[Tuple[int, int]] = []
         active: List[Tuple[int, int]] = []
-        non_active: List[Tuple[int, int]] = []
-        for r, c in empty_cells:
-            has_neighbor = False
-            dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
-            for dr, dc in dirs:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < size and 0 <= nc < size and board[nr][nc] != 0:
-                    has_neighbor = True
-                    break
-            if has_neighbor:
-                active.append((r, c))
-            else:
-                non_active.append((r, c))
+        for r in range(size):
+            row = board[r]
+            for c in range(size):
+                if row[c] == 0:
+                    has_neighbor = False
+                    dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
+                    for dr, dc in dirs:
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < size and 0 <= nc < size and board[nr][nc] != 0:
+                            has_neighbor = True
+                            break
+                    if has_neighbor:
+                        active.append((r, c))
+                    else:
+                        empty.append((r, c))
 
-        if not active and not non_active:
+        if not active and not empty:
             return 0
 
-        candidates = active if active else non_active
-        if len(candidates) < 6 and non_active:
-            non_active.sort()  # deterministic padding order
-            candidates = candidates + non_active[: min(6, len(non_active))]
+        candidates = active if active else empty
+        if len(candidates) < 6 and empty:
+            candidates = candidates + empty[: min(6, len(empty))]
 
         # Depth-adaptive branching limit
         if depth >= 3:
@@ -1290,7 +1254,6 @@ class SearchEngine:
 
             # ---- Make move ----
             board[r][c] = player
-            empty_cells.discard((r, c))
             self.zhash ^= self.zt[r][c][player]
             dsu_snap_parent = self.dsu_base.parent[:]
             dsu_snap_rank = self.dsu_base.rank[:]
@@ -1299,7 +1262,6 @@ class SearchEngine:
             # Check for win
             if dsu_check_win(self.dsu_base, size, player):
                 board[r][c] = 0
-                empty_cells.add((r, c))
                 self.zhash ^= self.zt[r][c][player]
                 self.dsu_base.parent = dsu_snap_parent
                 self.dsu_base.rank = dsu_snap_rank
@@ -1312,8 +1274,7 @@ class SearchEngine:
             # ---- PVS + LMR ----
             if i == 0:
                 # First move: full window, no reduction
-                val = -self._negamax(board, depth - 1, -beta, -alpha, opp,
-                                     empty_cells)
+                val = -self._negamax(board, depth - 1, -beta, -alpha, opp)
             else:
                 # Determine Late Move Reduction
                 # LMR is safe for "quiet" late moves: not PV hint,
@@ -1329,26 +1290,22 @@ class SearchEngine:
                 # Null-window search (possibly reduced)
                 val = -self._negamax(
                     board, depth - 1 - reduction, -alpha - 1, -alpha, opp,
-                    empty_cells,
                 )
 
                 # Re-search at full depth if reduced search raised alpha
                 if reduction > 0 and val > alpha:
                     val = -self._negamax(
                         board, depth - 1, -alpha - 1, -alpha, opp,
-                        empty_cells,
                     )
 
                 # Re-search with full window if null window raised alpha
                 if alpha < val < beta:
                     val = -self._negamax(
                         board, depth - 1, -beta, -val, opp,
-                        empty_cells,
                     )
 
             # ---- Undo move ----
             board[r][c] = 0
-            empty_cells.add((r, c))
             self.zhash ^= self.zt[r][c][player]
             self.dsu_base.parent = dsu_snap_parent
             self.dsu_base.rank = dsu_snap_rank
@@ -1567,3 +1524,5 @@ class SmartPlayer(Player):
         count_1 = sum(row.count(1) for row in board_matrix)
         count_2 = sum(row.count(2) for row in board_matrix)
         return 1 if count_1 <= count_2 else 2
+
+
