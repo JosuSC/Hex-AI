@@ -11,20 +11,20 @@ Techniques:
   * Zobrist Hashing + Bounded Transposition Table (depth-preferred)
   * Killer Moves (2 slots per depth)
   * History Heuristic (cumulative cutoff scores per cell)
-  * Two-Distance Heuristic (bidirectional Dijkstra) + virtual bridge detection
+    * Two-Distance Heuristic (bidirectional 0-1 BFS) + virtual bridge detection
   * In-place Make/Undo move (zero-copy)
   * Incremental Union-Find (DSU) for O(α(N)) win detection
   * Focused move generation (active zone + neighborhood)
   * Opening book with center-response strategy
 """
 
-import heapq
 import random
 import time
+from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
-from board import HexBoard
 from player import Player
+from board import HexBoard
 
 
 # =====================================================================
@@ -42,17 +42,18 @@ TT_LOWER: int = 1   # alpha cutoff  → lower bound
 TT_UPPER: int = 2   # beta  cutoff  → upper bound
 TT_PLAYER_MIX: int = 0x9E3779B97F4A7C15   # golden-ratio constant
 TT_MAX_ENTRIES: int = 500_000              # memory safety cap (~50 MB)
+EVAL_CACHE_MAX_ENTRIES: int = 200_000      # bounded static-eval cache
 
 # -- Zobrist Hashing --
 ZOBRIST_SEED: int = 42   # fixed seed → deterministic hashes
 ZOBRIST_BITS: int = 64
 
-# -- Even-R Hex Offset Neighbor Directions --
+# -- Standard Rhombus Hex Neighbor Directions --
 EVEN_DIRS: Tuple[Tuple[int, int], ...] = (
-    (-1, 0), (-1, 1), (0, -1), (0, 1), (1, 0), (1, 1),
+    (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 0), (0, -1),
 )
 ODD_DIRS: Tuple[Tuple[int, int], ...] = (
-    (-1, -1), (-1, 0), (0, -1), (0, 1), (1, -1), (1, 0),
+    (0, -1), (-1, 0), (0, 1), (1, 1), (1, 0), (1, -1),
 )
 
 # -- Move Ordering Priorities --
@@ -66,14 +67,17 @@ OPP_NEIGHBOR_BONUS: int = 7
 CENTRALITY_WEIGHT: float = 3.0
 AXIS_ALIGNMENT_WEIGHT: float = 1.5
 HISTORY_MULTIPLIER: int = 2
+MOVE_TIEBREAK_SCALE: float = 0.001
 
 # -- Evaluation Weights --
 DISTANCE_WEIGHT: int = 200
 PATH_COUNT_WEIGHT: int = 10
 PATH_COUNT_MAX_SIZE: int = 11   # path counting only for boards ≤ this size
+FULL_EVAL_MAX_SIZE: int = 11    # full two-distance only up to this size
 
 # -- Search Parameters --
 TIME_BUDGET: float = 4.0
+TIME_SAFETY_FACTOR: float = 0.90
 TIME_CHECK_MASK: int = 1023     # check clock every (N & mask == 0)
 MAX_SEARCH_DEPTH: int = 50
 MAX_KILLER_DEPTH: int = 64
@@ -90,7 +94,8 @@ ASPIRATION_MIN_DEPTH: int = 3   # first depth where aspiration is used
 
 # -- Board-Size Thresholds --
 LAZY_NEIGHBOR_THRESHOLD: int = 100   # lazy neighbor table above this size
-LARGE_BOARD_THRESHOLD: int = 100     # sparse fast-path above this size
+LARGE_BOARD_THRESHOLD: int = 18      # sparse fast-path for 19x19+
+LARGE_BOARD_SPARSE_PHASE: float = 0.55   # use sparse policy in early game
 BRIDGE_MAX_SIZE: int = 15            # precompute bridges only up to this
 
 # -- Large-Board Fast-Path --
@@ -105,12 +110,28 @@ _PLAYER_ATTRIBUTES: Tuple[str, ...] = (
     "player_id", "player", "id", "color", "number",
 )
 
+# Compatibility globals expected by the harness cleanup hook.
+# They are intentionally state-free and unused by the engine logic.
+
+
+class _CompatNoStateCache:
+    """No-op cache API for external harness compatibility."""
+
+    __slots__ = ()
+
+    def clear(self) -> None:
+        """Mimic dict.clear() without retaining any mutable state."""
+        return None
+
+
+_NEIGHBOR_TABLE_CACHE = _CompatNoStateCache()
+_BRIDGE_CACHE = _CompatNoStateCache()
+_ZOBRIST_CACHE = _CompatNoStateCache()
+
 
 # =====================================================================
 #  NEIGHBOR TABLE (cached per board size)
 # =====================================================================
-
-_NEIGHBOR_TABLE_CACHE: Dict[int, object] = {}
 
 
 def _compute_neighbors(
@@ -163,18 +184,13 @@ class _LazyRow:
 
 
 def build_neighbor_table(size: int):
-    """Build or retrieve the cached neighbor lookup table for *size*.
+    """Build a neighbor lookup table for *size*.
 
     Returns ``LazyNeighborTable`` for boards > ``LAZY_NEIGHBOR_THRESHOLD``,
     or a fully precomputed 2-D list otherwise.
     """
-    if size in _NEIGHBOR_TABLE_CACHE:
-        return _NEIGHBOR_TABLE_CACHE[size]
-
     if size > LAZY_NEIGHBOR_THRESHOLD:
-        table = LazyNeighborTable(size)
-        _NEIGHBOR_TABLE_CACHE[size] = table
-        return table
+        return LazyNeighborTable(size)
 
     table: List[List[Optional[Tuple]]] = [[None] * size for _ in range(size)]
     for r in range(size):
@@ -186,7 +202,6 @@ def build_neighbor_table(size: int):
                 if 0 <= nr < size and 0 <= nc < size:
                     neighbors.append((nr, nc))
             table[r][c] = tuple(neighbors)
-    _NEIGHBOR_TABLE_CACHE[size] = table
     return table
 
 
@@ -198,14 +213,9 @@ def build_neighbor_table(size: int):
 # carrier, the player fills the other → the virtual connection holds.
 # Each entry: (dest_r, dest_c, carrier1_r, carrier1_c, carrier2_r, carrier2_c).
 
-_BRIDGE_CACHE: Dict[int, List[List[List]]] = {}
-
 
 def build_bridge_table(size: int, ntable) -> List[List[List]]:
     """Precompute virtual bridge patterns for every cell on the board."""
-    if size in _BRIDGE_CACHE:
-        return _BRIDGE_CACHE[size]
-
     bridges: List[List[List]] = [[[] for _ in range(size)] for _ in range(size)]
     for r in range(size):
         for c in range(size):
@@ -226,7 +236,6 @@ def build_bridge_table(size: int, ntable) -> List[List[List]]:
                                     (nr2, nc2, nr, nc, other[0], other[1])
                                 )
                                 break
-    _BRIDGE_CACHE[size] = bridges
     return bridges
 
 
@@ -234,20 +243,14 @@ def build_bridge_table(size: int, ntable) -> List[List[List]]:
 #  ZOBRIST HASHING
 # =====================================================================
 
-_ZOBRIST_CACHE: Dict[int, List[List[List[int]]]] = {}
-
 
 def get_zobrist_table(size: int) -> List[List[List[int]]]:
-    """Get or create a deterministic Zobrist hash table for *size*."""
-    if size in _ZOBRIST_CACHE:
-        return _ZOBRIST_CACHE[size]
-
+    """Create a deterministic Zobrist hash table for *size*."""
     rng = random.Random(ZOBRIST_SEED)
     zt: List[List[List[int]]] = [
         [[rng.getrandbits(ZOBRIST_BITS) for _ in range(3)] for _ in range(size)]
         for _ in range(size)
     ]
-    _ZOBRIST_CACHE[size] = zt
     return zt
 
 
@@ -273,38 +276,54 @@ def compute_zobrist(
 
 
 class DSU:
-    """Disjoint-Set Union with path halving and union by rank.
+    """Rollback-capable DSU with union by rank.
 
-    Four virtual border nodes allow win detection via a single
-    ``connected()`` query (e.g. LEFT↔RIGHT for player 1).
+    Uses checkpoints/rollback to support make/undo search without
+    copying full parent/rank arrays at every node.
     """
 
-    __slots__ = ("parent", "rank", "n", "size")
+    __slots__ = ("parent", "rank", "n", "size", "_changes")
 
     def __init__(self, size: int) -> None:
         self.size: int = size
         self.n: int = size * size + 4
         self.parent: List[int] = list(range(self.n))
         self.rank: List[int] = [0] * self.n
+        self._changes: List[Tuple[int, int, int, int]] = []
 
     def find(self, x: int) -> int:
-        """Find representative with path halving."""
+        """Find representative without compression (rollback-safe)."""
         p = self.parent
         while p[x] != x:
-            p[x] = p[p[x]]
             x = p[x]
         return x
 
     def union(self, a: int, b: int) -> None:
-        """Union by rank."""
+        """Union by rank with rollback logging."""
         a, b = self.find(a), self.find(b)
         if a == b:
             return
         if self.rank[a] < self.rank[b]:
             a, b = b, a
+        self._changes.append((b, self.parent[b], a, self.rank[a]))
         self.parent[b] = a
         if self.rank[a] == self.rank[b]:
             self.rank[a] += 1
+
+    def checkpoint(self) -> int:
+        """Return rollback checkpoint for the current DSU state."""
+        return len(self._changes)
+
+    def rollback(self, checkpoint: int) -> None:
+        """Rollback DSU state to a previous checkpoint."""
+        while len(self._changes) > checkpoint:
+            b, old_parent_b, a, old_rank_a = self._changes.pop()
+            self.parent[b] = old_parent_b
+            self.rank[a] = old_rank_a
+
+    def clear_history(self) -> None:
+        """Discard rollback history while keeping current structure."""
+        self._changes.clear()
 
     def connected(self, a: int, b: int) -> bool:
         """Check whether two nodes share a component."""
@@ -312,16 +331,16 @@ class DSU:
 
     def copy(self) -> "DSU":
         """Snapshot the DSU state (shallow copy of internal arrays)."""
-        d = DSU.__new__(DSU)
-        d.size = self.size
+        d = DSU(self.size)
         d.n = self.n
         d.parent = self.parent[:]
         d.rank = self.rank[:]
+        d.clear_history()
         return d
 
 
 def build_dsu_from_board(
-    board: List[List[int]], size: int, ntable,
+    board: List[List[int]], size: int, _ntable,
 ) -> DSU:
     """Construct a DSU reflecting all stones currently on the board."""
     n2 = size * size
@@ -438,8 +457,6 @@ def check_connection(
     ntable,
 ) -> bool:
     """BFS-based connectivity check — kept for test compatibility."""
-    from collections import deque
-
     if player == 1:
         starts = [(r, 0) for r in range(size) if board[r][0] == player]
         if not starts:
@@ -480,17 +497,18 @@ def check_connection(
 # =====================================================================
 
 
-def dijkstra_distance(
+def bfs01_distance(
     board: List[List[int]], size: int, player: int, ntable,
 ) -> float:
     """Shortest-path distance to connect *player*'s two borders.
 
+    Uses 0-1 BFS for binary costs.
     Cell costs: own stone = 0, empty = 1, opponent = ∞ (impassable).
     Returns ``INF`` if no path exists.
     """
     opp = 3 - player
     dist = [[INF] * size for _ in range(size)]
-    heap: List[Tuple[float, int, int]] = []
+    q = deque()
 
     if player == 1:
         for r in range(size):
@@ -500,21 +518,27 @@ def dijkstra_distance(
             cost = 0 if v == player else 1
             if cost < dist[r][0]:
                 dist[r][0] = cost
-                heapq.heappush(heap, (cost, r, 0))
-        while heap:
-            d, r, c = heapq.heappop(heap)
-            if d > dist[r][c]:
-                continue
+                if cost == 0:
+                    q.appendleft((r, 0))
+                else:
+                    q.append((r, 0))
+        while q:
+            r, c = q.popleft()
+            d = dist[r][c]
             if c == size - 1:
                 return d
             for nr, nc in ntable[r][c]:
                 v = board[nr][nc]
                 if v == opp:
                     continue
-                nd = d + (0 if v == player else 1)
+                w = 0 if v == player else 1
+                nd = d + w
                 if nd < dist[nr][nc]:
                     dist[nr][nc] = nd
-                    heapq.heappush(heap, (nd, nr, nc))
+                    if w == 0:
+                        q.appendleft((nr, nc))
+                    else:
+                        q.append((nr, nc))
     else:
         for c in range(size):
             v = board[0][c]
@@ -523,35 +547,44 @@ def dijkstra_distance(
             cost = 0 if v == player else 1
             if cost < dist[0][c]:
                 dist[0][c] = cost
-                heapq.heappush(heap, (cost, 0, c))
-        while heap:
-            d, r, c = heapq.heappop(heap)
-            if d > dist[r][c]:
-                continue
+                if cost == 0:
+                    q.appendleft((0, c))
+                else:
+                    q.append((0, c))
+        while q:
+            r, c = q.popleft()
+            d = dist[r][c]
             if r == size - 1:
                 return d
             for nr, nc in ntable[r][c]:
                 v = board[nr][nc]
                 if v == opp:
                     continue
-                nd = d + (0 if v == player else 1)
+                w = 0 if v == player else 1
+                nd = d + w
                 if nd < dist[nr][nc]:
                     dist[nr][nc] = nd
-                    heapq.heappush(heap, (nd, nr, nc))
+                    if w == 0:
+                        q.appendleft((nr, nc))
+                    else:
+                        q.append((nr, nc))
     return INF
 
 
-def dijkstra_full(
+def bfs01_full(
     board: List[List[int]], size: int, player: int, ntable,
 ) -> List[List[float]]:
-    """Full Dijkstra from *player*'s start border.
+    """Full 0-1 BFS from *player*'s start border.
+
+    For binary costs (0 for own stones, 1 for empty cells),
+    runs in O(V + E) time.
 
     Returns the complete distance matrix needed for two-distance
     evaluation and path-count tie-breaking.
     """
     opp = 3 - player
     dist = [[INF] * size for _ in range(size)]
-    heap: List[Tuple[float, int, int]] = []
+    q = deque()
 
     if player == 1:
         for r in range(size):
@@ -561,7 +594,10 @@ def dijkstra_full(
             cost = 0 if v == player else 1
             if cost < dist[r][0]:
                 dist[r][0] = cost
-                heapq.heappush(heap, (cost, r, 0))
+                if cost == 0:
+                    q.appendleft((r, 0))
+                else:
+                    q.append((r, 0))
     else:
         for c in range(size):
             v = board[0][c]
@@ -570,31 +606,37 @@ def dijkstra_full(
             cost = 0 if v == player else 1
             if cost < dist[0][c]:
                 dist[0][c] = cost
-                heapq.heappush(heap, (cost, 0, c))
+                if cost == 0:
+                    q.appendleft((0, c))
+                else:
+                    q.append((0, c))
 
-    while heap:
-        d, r, c = heapq.heappop(heap)
-        if d > dist[r][c]:
-            continue
+    while q:
+        r, c = q.popleft()
+        d = dist[r][c]
         for nr, nc in ntable[r][c]:
             v = board[nr][nc]
             if v == opp:
                 continue
-            nd = d + (0 if v == player else 1)
+            w = 0 if v == player else 1
+            nd = d + w
             if nd < dist[nr][nc]:
                 dist[nr][nc] = nd
-                heapq.heappush(heap, (nd, nr, nc))
+                if w == 0:
+                    q.appendleft((nr, nc))
+                else:
+                    q.append((nr, nc))
 
     return dist
 
 
-def dijkstra_reverse(
+def bfs01_reverse(
     board: List[List[int]], size: int, player: int, ntable,
 ) -> List[List[float]]:
-    """Dijkstra from *player*'s goal border (reverse direction)."""
+    """0-1 BFS from *player*'s goal border (reverse direction)."""
     opp = 3 - player
     dist = [[INF] * size for _ in range(size)]
-    heap: List[Tuple[float, int, int]] = []
+    q = deque()
 
     if player == 1:
         for r in range(size):
@@ -604,7 +646,10 @@ def dijkstra_reverse(
             cost = 0 if v == player else 1
             if cost < dist[r][size - 1]:
                 dist[r][size - 1] = cost
-                heapq.heappush(heap, (cost, r, size - 1))
+                if cost == 0:
+                    q.appendleft((r, size - 1))
+                else:
+                    q.append((r, size - 1))
     else:
         for c in range(size):
             v = board[size - 1][c]
@@ -613,20 +658,26 @@ def dijkstra_reverse(
             cost = 0 if v == player else 1
             if cost < dist[size - 1][c]:
                 dist[size - 1][c] = cost
-                heapq.heappush(heap, (cost, size - 1, c))
+                if cost == 0:
+                    q.appendleft((size - 1, c))
+                else:
+                    q.append((size - 1, c))
 
-    while heap:
-        d, r, c = heapq.heappop(heap)
-        if d > dist[r][c]:
-            continue
+    while q:
+        r, c = q.popleft()
+        d = dist[r][c]
         for nr, nc in ntable[r][c]:
             v = board[nr][nc]
             if v == opp:
                 continue
-            nd = d + (0 if v == player else 1)
+            w = 0 if v == player else 1
+            nd = d + w
             if nd < dist[nr][nc]:
                 dist[nr][nc] = nd
-                heapq.heappush(heap, (nd, nr, nc))
+                if w == 0:
+                    q.appendleft((nr, nc))
+                else:
+                    q.append((nr, nc))
 
     return dist
 
@@ -634,7 +685,7 @@ def dijkstra_reverse(
 def two_distance(
     board: List[List[int]], size: int, player: int, ntable,
 ) -> Tuple[float, int]:
-    """Two-distance heuristic: bidirectional Dijkstra + on-path cell count.
+    """Two-distance heuristic: bidirectional 0-1 BFS + on-path cell count.
 
     Computes ``dist_fwd + dist_rev`` for every non-opponent cell.
     The minimum is the connection distance; the count of cells achieving
@@ -643,8 +694,8 @@ def two_distance(
     Returns:
         (shortest_distance, on_path_cell_count)
     """
-    dfwd = dijkstra_full(board, size, player, ntable)
-    drev = dijkstra_reverse(board, size, player, ntable)
+    dfwd = bfs01_full(board, size, player, ntable)
+    drev = bfs01_reverse(board, size, player, ntable)
 
     if player == 1:
         min_dist = min(dfwd[r][size - 1] for r in range(size))
@@ -673,13 +724,13 @@ def evaluate_fast(
     opponent: int,
     ntable,
 ) -> int:
-    """Fast Dijkstra-based evaluation for deep tree nodes.
+    """Fast 0-1 BFS-based evaluation for deep tree nodes.
 
     For small boards (≤ ``PATH_COUNT_MAX_SIZE``), augments the distance
     difference with path-count tie-breaking to distinguish blocking moves.
     """
-    my_dist = dijkstra_distance(board, size, my_player, ntable)
-    opp_dist = dijkstra_distance(board, size, opponent, ntable)
+    my_dist = bfs01_distance(board, size, my_player, ntable)
+    opp_dist = bfs01_distance(board, size, opponent, ntable)
 
     if my_dist >= INF and opp_dist >= INF:
         return 0
@@ -690,7 +741,7 @@ def evaluate_fast(
 
     score = (opp_dist - my_dist) * DISTANCE_WEIGHT
 
-    # Path-count tie-breaking uses two_distance (bidirectional Dijkstra)
+    # Path-count tie-breaking uses two_distance (bidirectional 0-1 BFS)
     # to count on-path cells — more paths = stronger position
     if size <= PATH_COUNT_MAX_SIZE and my_dist == opp_dist:
         _, my_paths = two_distance(board, size, my_player, ntable)
@@ -759,7 +810,7 @@ class SearchEngine:
         self.opponent: int = 3 - my_player
         self.size: int = size
         self.ntable = ntable
-        self.time_limit: float = time_limit
+        self.time_limit: float = max(0.01, time_limit * TIME_SAFETY_FACTOR)
         self.start_time: float = time.time()
         self.nodes: int = 0
         self.timed_out: bool = False
@@ -770,6 +821,7 @@ class SearchEngine:
 
         # Bounded transposition table
         self.tt: Dict[int, Tuple[int, int, float, Optional[Tuple[int, int]]]] = {}
+        self.eval_cache: Dict[int, float] = {}
 
         # Killer moves: 2 slots per depth
         self.killers: List[List[Optional[Tuple[int, int]]]] = [
@@ -783,6 +835,7 @@ class SearchEngine:
 
         # DSU built from current board state
         self.dsu_base: DSU = build_dsu_from_board(board, size, ntable)
+        self.dsu_base.clear_history()
 
         # Bridge table for move ordering (only worthwhile for small boards)
         if size <= BRIDGE_MAX_SIZE:
@@ -797,8 +850,10 @@ class SearchEngine:
             self.max_branch = 28
         elif size <= 11:
             self.max_branch = 22
+        elif size <= 15:
+            self.max_branch = 18
         else:
-            self.max_branch = 16
+            self.max_branch = 14
 
         # Precompute hot zone (empty cells adjacent to existing stones)
         self._precompute_active_zone(board)
@@ -955,6 +1010,16 @@ class SearchEngine:
             else:
                 score += (size - abs(r - center)) * AXIS_ALIGNMENT_WEIGHT
 
+            # Deterministic tie-breaker avoids fixed grid-order bias
+            # while keeping run-to-run reproducibility.
+            tie = (
+                (r * 73_856_093)
+                ^ (c * 19_349_663)
+                ^ (player * 83_492_791)
+                ^ self.zhash
+            ) & 1023
+            score += tie * MOVE_TIEBREAK_SCALE
+
             scored.append((-score, r, c))
 
         scored.sort()
@@ -967,9 +1032,145 @@ class SearchEngine:
                 self.killers[depth][1] = self.killers[depth][0]
                 self.killers[depth][0] = move
 
+    @staticmethod
+    def _remove_empty_cell(
+        empty_cells: List[Tuple[int, int]],
+        empty_pos: Dict[Tuple[int, int], int],
+        move: Tuple[int, int],
+    ) -> Tuple[int, Tuple[int, int]]:
+        """Remove *move* from empty list in O(1) and return restore token."""
+        idx = empty_pos[move]
+        swapped = empty_cells[-1]
+        empty_cells[idx] = swapped
+        empty_cells.pop()
+        empty_pos[swapped] = idx
+        del empty_pos[move]
+        return idx, swapped
+
+    @staticmethod
+    def _restore_empty_cell(
+        empty_cells: List[Tuple[int, int]],
+        empty_pos: Dict[Tuple[int, int], int],
+        move: Tuple[int, int],
+        idx: int,
+        swapped: Tuple[int, int],
+    ) -> None:
+        """Restore a move removed by ``_remove_empty_cell``."""
+        empty_cells.append(swapped)
+        end = len(empty_cells) - 1
+        if idx < end:
+            empty_cells[idx] = move
+            empty_pos[move] = idx
+            empty_pos[swapped] = end
+        else:
+            empty_cells[idx] = move
+            empty_pos[move] = idx
+
+    def _prune_inferior_cells(
+        self,
+        board: List[List[int]],
+        candidates: List[Tuple[int, int]],
+        player: int,
+    ) -> List[Tuple[int, int]]:
+        """Conservatively remove low-impact isolated cells from candidates."""
+        if len(candidates) <= self.max_branch:
+            return candidates
+
+        size = self.size
+        center = (size - 1) / 2.0
+        central_limit = max(2.0, size * 0.45)
+        pruned: List[Tuple[int, int]] = []
+
+        for r, c in candidates:
+            if board[r][c] != 0:
+                continue
+
+            if any(board[nr][nc] != 0 for nr, nc in self.ntable[r][c]):
+                pruned.append((r, c))
+                continue
+
+            if abs(r - center) + abs(c - center) <= central_limit:
+                pruned.append((r, c))
+                continue
+
+            if player == 1 and c in (0, size - 1):
+                pruned.append((r, c))
+                continue
+            if player == 2 and r in (0, size - 1):
+                pruned.append((r, c))
+
+        return pruned if pruned else candidates
+
     # -----------------------------------------------------------------
     #  Immediate Win Detection
     # -----------------------------------------------------------------
+
+    def _winning_cells_for_player(
+        self,
+        board: List[List[int]],
+        player: int,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[int, int]]:
+        """Return empty cells that immediately win for *player*."""
+        size = self.size
+        ntable = self.ntable
+        winning_cells: List[Tuple[int, int]] = []
+
+        for r, c in self.all_empty:
+            if board[r][c] != 0:
+                continue
+
+            board[r][c] = player
+            dsu_checkpoint = self.dsu_base.checkpoint()
+            dsu_add_stone(self.dsu_base, board, size, ntable, r, c, player)
+            won = dsu_check_win(self.dsu_base, size, player)
+
+            board[r][c] = 0
+            self.dsu_base.rollback(dsu_checkpoint)
+
+            if won:
+                winning_cells.append((r, c))
+                if limit is not None and len(winning_cells) >= limit:
+                    break
+
+        return winning_cells
+
+    def _bridge_must_play_cells(
+        self,
+        board: List[List[int]],
+        player: int,
+        limit: Optional[int] = None,
+    ) -> List[Tuple[int, int]]:
+        """Return carrier cells that block opponent virtual-bridge threats."""
+        bridge_table = self.bridge_table
+        if bridge_table is None:
+            return []
+
+        must_play: List[Tuple[int, int]] = []
+        seen: Set[Tuple[int, int]] = set()
+
+        for r in range(self.size):
+            for c in range(self.size):
+                if board[r][c] != player:
+                    continue
+
+                for dest_r, dest_c, c1r, c1c, c2r, c2c in bridge_table[r][c]:
+                    if board[dest_r][dest_c] != player:
+                        continue
+                    if board[c1r][c1c] != 0 or board[c2r][c2c] != 0:
+                        continue
+
+                    if (c1r, c1c) not in seen:
+                        must_play.append((c1r, c1c))
+                        seen.add((c1r, c1c))
+                    if (c2r, c2c) not in seen:
+                        must_play.append((c2r, c2c))
+                        seen.add((c2r, c2c))
+
+                    if limit is not None and len(must_play) >= limit:
+                        return must_play
+
+        return must_play
 
     def _find_immediate_win(
         self, board: List[List[int]],
@@ -979,28 +1180,8 @@ class SearchEngine:
         Runs before the full search to guarantee winning moves are never
         missed due to pruning or move-ordering limitations.
         """
-        size = self.size
-        ntable = self.ntable
-        player = self.my_player
-
-        for r in range(size):
-            for c in range(size):
-                if board[r][c] != 0:
-                    continue
-                # Make move
-                board[r][c] = player
-                snap_parent = self.dsu_base.parent[:]
-                snap_rank = self.dsu_base.rank[:]
-                dsu_add_stone(self.dsu_base, board, size, ntable, r, c, player)
-                won = dsu_check_win(self.dsu_base, size, player)
-                # Undo move
-                board[r][c] = 0
-                self.dsu_base.parent = snap_parent
-                self.dsu_base.rank = snap_rank
-                if won:
-                    return (r, c)
-
-        return None
+        wins = self._winning_cells_for_player(board, self.my_player, limit=1)
+        return wins[0] if wins else None
 
     # -----------------------------------------------------------------
     #  Iterative Deepening with Aspiration Windows
@@ -1013,17 +1194,43 @@ class SearchEngine:
         search with a narrow alpha-beta window around the previous
         iteration's score, falling back to full window on failure.
         """
-        empty = self.all_empty
+        empty = [
+            cell for cell in self.all_empty
+            if board[cell[0]][cell[1]] == 0
+        ]
         if not empty:
             return None
+        empty_pos: Dict[Tuple[int, int], int] = {
+            cell: idx for idx, cell in enumerate(empty)
+        }
 
         # Immediate win detection — bypasses the entire search tree
         win_move = self._find_immediate_win(board)
         if win_move is not None:
             return win_move
 
+        # Must-block tactical defense: if opponent has immediate wins,
+        # block those cells before strategic search.
+        forced_blocks: Optional[List[Tuple[int, int]]] = None
+        opponent_wins = self._winning_cells_for_player(
+            board, self.opponent, limit=self.max_branch,
+        )
+        if opponent_wins:
+            if len(opponent_wins) == 1:
+                return opponent_wins[0]
+            forced_blocks = opponent_wins
+
+        # Basic H-search style must-play from virtual bridges.
+        bridge_blocks: List[Tuple[int, int]] = []
+        if forced_blocks is None:
+            bridge_blocks = self._bridge_must_play_cells(
+                board, self.opponent, limit=self.max_branch,
+            )
+
         # Build candidate set: prioritise active zone, pad with central cells
-        if self.active:
+        if forced_blocks is not None:
+            candidates = forced_blocks
+        elif self.active:
             candidates = list(self.active)
             rest = [cell for cell in empty if cell not in self.active]
             center = (self.size - 1) / 2.0
@@ -1031,6 +1238,15 @@ class SearchEngine:
             candidates.extend(rest[:max(5, self.max_branch - len(candidates))])
         else:
             candidates = empty[:]
+
+        if forced_blocks is None:
+            candidates = self._prune_inferior_cells(
+                board, candidates, self.my_player,
+            )
+
+        if bridge_blocks:
+            bridge_set = set(bridge_blocks)
+            candidates = bridge_blocks + [c for c in candidates if c not in bridge_set]
 
         # Trim to branching limit
         if len(candidates) > self.max_branch:
@@ -1061,15 +1277,17 @@ class SearchEngine:
                     asp_alpha = last_score - ASPIRATION_WINDOW
                     asp_beta = last_score + ASPIRATION_WINDOW
                     move, score = self._search_root(
-                        board, ordered, depth, asp_alpha, asp_beta,
+                        board, ordered, depth, empty, empty_pos, asp_alpha, asp_beta,
                     )
                     # Fall back to full window on aspiration failure
                     if score <= asp_alpha or score >= asp_beta:
                         move, score = self._search_root(
-                            board, ordered, depth,
+                            board, ordered, depth, empty, empty_pos,
                         )
                 else:
-                    move, score = self._search_root(board, ordered, depth)
+                    move, score = self._search_root(
+                        board, ordered, depth, empty, empty_pos,
+                    )
 
                 best_move = move
                 pv_move = move
@@ -1093,6 +1311,8 @@ class SearchEngine:
         board: List[List[int]],
         moves: List[Tuple[int, int]],
         depth: int,
+        empty_cells: List[Tuple[int, int]],
+        empty_pos: Dict[Tuple[int, int], int],
         alpha: float = -INF,
         beta: float = INF,
     ) -> Tuple[Tuple[int, int], float]:
@@ -1103,12 +1323,14 @@ class SearchEngine:
         for i, move in enumerate(moves):
             self._check_time()
             r, c = move
+            rm_idx, rm_swapped = self._remove_empty_cell(
+                empty_cells, empty_pos, move,
+            )
 
             # ---- Make move ----
             board[r][c] = self.my_player
             self.zhash ^= self.zt[r][c][self.my_player]
-            dsu_snap_parent = self.dsu_base.parent[:]
-            dsu_snap_rank = self.dsu_base.rank[:]
+            dsu_checkpoint = self.dsu_base.checkpoint()
             dsu_add_stone(
                 self.dsu_base, board, self.size, self.ntable,
                 r, c, self.my_player,
@@ -1117,29 +1339,36 @@ class SearchEngine:
             if dsu_check_win(self.dsu_base, self.size, self.my_player):
                 board[r][c] = 0
                 self.zhash ^= self.zt[r][c][self.my_player]
-                self.dsu_base.parent = dsu_snap_parent
-                self.dsu_base.rank = dsu_snap_rank
+                self.dsu_base.rollback(dsu_checkpoint)
+                self._restore_empty_cell(
+                    empty_cells, empty_pos, move, rm_idx, rm_swapped,
+                )
                 return move, WIN_SCORE
 
             # PVS: full window for first child, null window for rest
             if i == 0:
                 score = -self._negamax(
-                    board, depth - 1, -beta, -alpha, self.opponent,
+                    board, depth - 1, -beta, -alpha,
+                    self.opponent, empty_cells, empty_pos,
                 )
             else:
                 score = -self._negamax(
-                    board, depth - 1, -alpha - 1, -alpha, self.opponent,
+                    board, depth - 1, -alpha - 1, -alpha,
+                    self.opponent, empty_cells, empty_pos,
                 )
                 if alpha < score < beta:
                     score = -self._negamax(
-                        board, depth - 1, -beta, -score, self.opponent,
+                        board, depth - 1, -beta, -score,
+                        self.opponent, empty_cells, empty_pos,
                     )
 
             # ---- Undo move ----
             board[r][c] = 0
             self.zhash ^= self.zt[r][c][self.my_player]
-            self.dsu_base.parent = dsu_snap_parent
-            self.dsu_base.rank = dsu_snap_rank
+            self.dsu_base.rollback(dsu_checkpoint)
+            self._restore_empty_cell(
+                empty_cells, empty_pos, move, rm_idx, rm_swapped,
+            )
 
             if score > best_score:
                 best_score = score
@@ -1163,6 +1392,8 @@ class SearchEngine:
         alpha: float,
         beta: float,
         player: int,
+        empty_cells: List[Tuple[int, int]],
+        empty_pos: Dict[Tuple[int, int], int],
     ) -> float:
         """Recursive negamax search with all pruning enhancements.
 
@@ -1200,33 +1431,45 @@ class SearchEngine:
 
         # ---- Leaf Evaluation ----
         if depth <= 0:
-            return evaluate_fast(board, size, player, opp, ntable)
+            eval_key = tt_key ^ 0xD1B54A32D192ED03
+            cached = self.eval_cache.get(eval_key)
+            if cached is not None:
+                return cached
+
+            if depth == 0 and size <= FULL_EVAL_MAX_SIZE:
+                value = evaluate_board(board, size, player, opp, ntable)
+            else:
+                value = evaluate_fast(board, size, player, opp, ntable)
+
+            if len(self.eval_cache) >= EVAL_CACHE_MAX_ENTRIES:
+                self.eval_cache.clear()
+            self.eval_cache[eval_key] = value
+            return value
 
         # ---- Move Generation: active zone focus ----
-        empty: List[Tuple[int, int]] = []
         active: List[Tuple[int, int]] = []
-        for r in range(size):
-            row = board[r]
-            for c in range(size):
-                if row[c] == 0:
-                    has_neighbor = False
-                    dirs = EVEN_DIRS if r % 2 == 0 else ODD_DIRS
-                    for dr, dc in dirs:
-                        nr, nc = r + dr, c + dc
-                        if 0 <= nr < size and 0 <= nc < size and board[nr][nc] != 0:
-                            has_neighbor = True
-                            break
-                    if has_neighbor:
-                        active.append((r, c))
-                    else:
-                        empty.append((r, c))
+        quiet: List[Tuple[int, int]] = []
+        for r, c in empty_cells:
+            has_neighbor = False
+            for nr, nc in ntable[r][c]:
+                if board[nr][nc] != 0:
+                    has_neighbor = True
+                    break
+            if has_neighbor:
+                active.append((r, c))
+            else:
+                quiet.append((r, c))
 
-        if not active and not empty:
+        if not active and not quiet:
             return 0
 
-        candidates = active if active else empty
-        if len(candidates) < 6 and empty:
-            candidates = candidates + empty[: min(6, len(empty))]
+        if active:
+            candidates = active
+            if len(candidates) < 6 and quiet:
+                candidates = candidates + quiet[: min(6 - len(candidates), len(quiet))]
+        else:
+            candidates = quiet
+        candidates = self._prune_inferior_cells(board, candidates, player)
 
         # Depth-adaptive branching limit
         if depth >= 3:
@@ -1240,6 +1483,8 @@ class SearchEngine:
         moves = self._order_moves(board, player, depth, pv_hint, candidates)
         if len(moves) > branch_limit:
             moves = moves[:branch_limit]
+        if not moves:
+            return 0
 
         best_value = -INF
         best_move = moves[0] if moves else None
@@ -1251,20 +1496,24 @@ class SearchEngine:
 
         for i, move in enumerate(moves):
             r, c = move
+            rm_idx, rm_swapped = self._remove_empty_cell(
+                empty_cells, empty_pos, move,
+            )
 
             # ---- Make move ----
             board[r][c] = player
             self.zhash ^= self.zt[r][c][player]
-            dsu_snap_parent = self.dsu_base.parent[:]
-            dsu_snap_rank = self.dsu_base.rank[:]
+            dsu_checkpoint = self.dsu_base.checkpoint()
             dsu_add_stone(self.dsu_base, board, size, ntable, r, c, player)
 
             # Check for win
             if dsu_check_win(self.dsu_base, size, player):
                 board[r][c] = 0
                 self.zhash ^= self.zt[r][c][player]
-                self.dsu_base.parent = dsu_snap_parent
-                self.dsu_base.rank = dsu_snap_rank
+                self.dsu_base.rollback(dsu_checkpoint)
+                self._restore_empty_cell(
+                    empty_cells, empty_pos, move, rm_idx, rm_swapped,
+                )
                 val = WIN_SCORE + depth
                 self._tt_store(tt_key, depth, TT_LOWER, val, move)
                 self._store_killer(depth, move)
@@ -1274,7 +1523,9 @@ class SearchEngine:
             # ---- PVS + LMR ----
             if i == 0:
                 # First move: full window, no reduction
-                val = -self._negamax(board, depth - 1, -beta, -alpha, opp)
+                val = -self._negamax(
+                    board, depth - 1, -beta, -alpha, opp, empty_cells, empty_pos,
+                )
             else:
                 # Determine Late Move Reduction
                 # LMR is safe for "quiet" late moves: not PV hint,
@@ -1289,26 +1540,31 @@ class SearchEngine:
 
                 # Null-window search (possibly reduced)
                 val = -self._negamax(
-                    board, depth - 1 - reduction, -alpha - 1, -alpha, opp,
+                    board, depth - 1 - reduction, -alpha - 1, -alpha,
+                    opp, empty_cells, empty_pos,
                 )
 
                 # Re-search at full depth if reduced search raised alpha
                 if reduction > 0 and val > alpha:
                     val = -self._negamax(
-                        board, depth - 1, -alpha - 1, -alpha, opp,
+                        board, depth - 1, -alpha - 1, -alpha,
+                        opp, empty_cells, empty_pos,
                     )
 
                 # Re-search with full window if null window raised alpha
                 if alpha < val < beta:
                     val = -self._negamax(
-                        board, depth - 1, -beta, -val, opp,
+                        board, depth - 1, -beta, -val,
+                        opp, empty_cells, empty_pos,
                     )
 
             # ---- Undo move ----
             board[r][c] = 0
             self.zhash ^= self.zt[r][c][player]
-            self.dsu_base.parent = dsu_snap_parent
-            self.dsu_base.rank = dsu_snap_rank
+            self.dsu_base.rollback(dsu_checkpoint)
+            self._restore_empty_cell(
+                empty_cells, empty_pos, move, rm_idx, rm_swapped,
+            )
 
             if val > best_value:
                 best_value = val
@@ -1355,43 +1611,43 @@ class SmartPlayer(Player):
         board_matrix: List[List[int]] = board.board
         my_player: int = self._identify_player(board_matrix, size)
 
-        # ---- Large-board fast-path ----
-        if size > LARGE_BOARD_THRESHOLD:
-            return self._play_large_board(board_matrix, size, my_player)
+        legal_fallback = self._first_legal_move(board_matrix, size)
+        if legal_fallback is None:
+            return (0, 0)
 
-        ntable = build_neighbor_table(size)
-
-        # ---- Opening book ----
         empty_count = sum(
             1 for r in range(size) for c in range(size)
             if board_matrix[r][c] == 0
         )
 
+        # ---- Large-board fast-path ----
+        if (
+            size > LARGE_BOARD_THRESHOLD
+            and empty_count >= int(size * size * LARGE_BOARD_SPARSE_PHASE)
+        ):
+            move = self._play_large_board(board_matrix, size, my_player)
+            if self._is_valid_move(board_matrix, size, move):
+                return move
+            return legal_fallback
+
+        ntable = build_neighbor_table(size)
+
+        # ---- Opening book ----
         if empty_count >= size * size - 1:
             move = self._opening_move(board_matrix, size, my_player, ntable)
-            if move is not None:
+            if move is not None and self._is_valid_move(board_matrix, size, move):
                 return move
 
-        # Second-move hint: sort center-adjacent cells (search will refine)
-        if empty_count >= size * size - 2:
-            center = size // 2
-            candidates = [
-                (nr, nc)
-                for nr, nc in ntable[center][center]
-                if board_matrix[nr][nc] == 0
-            ]
-            if candidates:
-                if my_player == 1:
-                    candidates.sort(key=lambda rc: abs(rc[1] - center))
-                else:
-                    candidates.sort(key=lambda rc: abs(rc[0] - center))
-
         # ---- Full search ----
+        turn_budget = self._compute_turn_budget(size, empty_count)
         work = [row[:] for row in board_matrix]
         engine = SearchEngine(
-            my_player, size, ntable, work, time_limit=TIME_BUDGET,
+            my_player, size, ntable, work, time_limit=turn_budget,
         )
-        return engine.search(work)
+        move = engine.search(work)
+        if move is not None and self._is_valid_move(board_matrix, size, move):
+            return move
+        return legal_fallback
 
     # -----------------------------------------------------------------
     #  Opening Book
@@ -1502,14 +1758,61 @@ class SmartPlayer(Player):
                 if score > best_score:
                     best_score = score
                     best_move = (r, c)
-            return best_move
+            if best_move is not None:
+                return best_move
+
+        fallback = self._first_legal_move(board_matrix, size)
+        if fallback is not None:
+            return fallback
+        return (0, 0)
+
+    @staticmethod
+    def _compute_turn_budget(size: int, empty_count: int) -> float:
+        """Derive a phase-aware per-turn budget under the global cap."""
+        total_cells = size * size
+        progress = 1.0 - (empty_count / total_cells)
+
+        if progress < 0.20:
+            phase_factor = 0.65
+        elif progress < 0.60:
+            phase_factor = 0.78
+        else:
+            phase_factor = 0.88
+
+        if size <= 7:
+            phase_factor += 0.07
+
+        capped_factor = min(0.95, max(0.55, phase_factor))
+        return max(0.05, TIME_BUDGET * capped_factor)
+
+    @staticmethod
+    def _is_valid_move(
+        board_matrix: List[List[int]],
+        size: int,
+        move: Tuple[int, int],
+    ) -> bool:
+        """Validate that move is inside bounds and targets an empty cell."""
+        r, c = move
+        return 0 <= r < size and 0 <= c < size and board_matrix[r][c] == 0
+
+    @staticmethod
+    def _first_legal_move(
+        board_matrix: List[List[int]],
+        size: int,
+    ) -> Optional[Tuple[int, int]]:
+        """Return the first legal move available, or None if board is full."""
+        for r in range(size):
+            for c in range(size):
+                if board_matrix[r][c] == 0:
+                    return (r, c)
+        return None
 
     # -----------------------------------------------------------------
     #  Player Identification
     # -----------------------------------------------------------------
 
     def _identify_player(
-        self, board_matrix: List[List[int]], size: int,
+        self, board_matrix: List[List[int]], _size: int,
     ) -> int:
         """Determine which player we are.
 
@@ -1524,5 +1827,6 @@ class SmartPlayer(Player):
         count_1 = sum(row.count(1) for row in board_matrix)
         count_2 = sum(row.count(2) for row in board_matrix)
         return 1 if count_1 <= count_2 else 2
+
 
 
