@@ -1,61 +1,61 @@
-# Jugador Autónomo para HEX
+# Autonomous HEX Player
 
-Proyecto académico de **Inteligencia Artificial** enfocado en el diseño e implementación de un agente capaz de jugar **HEX** de forma autónoma.
+Academic project in **Artificial Intelligence** focused on the design and implementation of an agent capable of playing **HEX** autonomously.
 
-Este repositorio funciona como puerta de entrada al proyecto: qué contiene, cómo ejecutarlo y cómo navegar su estructura.
-
----
-
-## 📖 Introducción
-
-Este trabajo fue desarrollado en el contexto del **Primer Proyecto de IA** (MATCOM).  
-El objetivo general es construir un jugador competitivo para HEX que tome decisiones de calidad dentro de restricciones de tiempo.
-
-La explicación detallada de la estrategia, heurísticas y análisis técnico se encuentra en el **Hex-AI.pdf**.
+This repository serves as an entry point to the project: what it contains, how to run it, and how to navigate its structure.
 
 ---
 
-## 🧩 Contenido del repositorio
+## 📖 Introduction
+
+This work was developed in the context of the **First AI Project** (MATCOM).  
+The main objective is to build a competitive HEX player that makes high-quality decisions under time constraints.
+
+A detailed explanation of the strategy, heuristics, and technical analysis can be found in the **Hex-AI.pdf**.
+
+---
+
+## 🧩 Repository Contents
 
 - `solution.py`  
-  Implementación principal del jugador.
+  Main implementation of the player.
 - `README.md`  
-  Introducción y guía rápida del repositorio.
-- `*Hex-AI.pdf`  
-  Informe técnico con la explicación completa del enfoque.
+  Introduction and quick guide to the repository.
+- `Hex-AI.pdf`  
+  Technical report with the complete explanation of the approach.
 
 ---
 
-## ⚙️ Requisitos
+## ⚙️ Requirements
 
 - **Python 3.9+**
-- No se requieren dependencias externas (solo biblioteca estándar).
+- No external dependencies required (standard library only).
 
 ---
 
-## ▶️ Ejecución
+## ▶️ Execution
 
-La ejecución depende del entorno del curso/competencia que carga `solution.py`.  
-Para pruebas locales, utiliza el script o framework de evaluación correspondiente y verifica que el archivo esté en la ruta esperada.
-
----
-
-## 🎯 Objetivo académico
-
-- Aplicar conceptos de búsqueda y toma de decisiones en juegos.
-- Diseñar una solución eficiente bajo límite de tiempo.
-- Mantener código claro, organizado y extensible.
+Execution depends on the course/competition environment that loads `solution.py`.  
+For local testing, use the corresponding evaluation script or framework and ensure the file is in the expected path.
 
 ---
 
-## 👤 Autor
+## 🎯 Academic Objectives
 
-**[Josué Javier Senarega Claro]**  
-Facultad de Matemática y Computación (MATCOM)  
-Universidad de La Habana
+- Apply search and decision-making concepts in games.
+- Design an efficient solution under time constraints.
+- Maintain clean, organized, and extensible code.
 
 ---
 
-## 📄 Licencia
+## 👤 Author
 
-Proyecto compartido con fines **académicos y educativos**.
+**Josué Javier Senarega Claro**  
+Faculty of Mathematics and Computer Science (MATCOM)  
+University of Havana
+
+---
+
+## 📄 License
+
+Project shared for **academic and educational** purposes.
